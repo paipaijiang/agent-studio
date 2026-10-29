@@ -1,4 +1,6 @@
+
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import { db, saveDatabase } from './db.js';
 
 const app = express();
@@ -6,7 +8,10 @@ const PORT = 3001;
 
 app.use(express.json({ limit: '1mb' }));
 
-// 统一读取查询结果
+// ================================
+// 通用数据库工具
+// ================================
+
 function queryAll(sql, params = []) {
   const statement = db.prepare(sql);
 
@@ -28,7 +33,6 @@ function queryOne(sql, params = []) {
   return queryAll(sql, params)[0] ?? null;
 }
 
-// 获取 Agent 当前提示词
 function getAgent(id) {
   return queryOne(
     `SELECT id, name, description, model, status, updated_at, system_prompt
@@ -37,8 +41,32 @@ function getAgent(id) {
   );
 }
 
-// 保存提示词历史版本。
-// 内容没有变化时不重复创建版本。
+function getModel(id) {
+  return queryOne(
+    `SELECT id, name, provider, model_name, base_url, description,
+            is_enabled, is_default, created_at, updated_at
+     FROM model_catalog WHERE id = ?`,
+    [id]
+  );
+}
+
+function formatModel(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    name: row.name,
+    provider: row.provider,
+    modelName: row.model_name,
+    baseUrl: row.base_url,
+    description: row.description,
+    isEnabled: Boolean(row.is_enabled),
+    isDefault: Boolean(row.is_default),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function recordPromptVersion(agentId, prompt) {
   const latest = queryOne(
     `SELECT version_number, system_prompt
@@ -65,7 +93,94 @@ function recordPromptVersion(agentId, prompt) {
   return nextVersion;
 }
 
+// 检查模型配置字段。
+// 只允许 HTTP/HTTPS URL，不允许 URL 中包含用户名或密码。
+function validateModelInput(body, partial = false) {
+  const fields = [
+    'name',
+    'provider',
+    'modelName',
+    'baseUrl',
+    'description',
+    'isEnabled',
+    'isDefault',
+  ];
+
+  if (partial) {
+    for (const field of fields) {
+      if (
+        body[field] !== undefined &&
+        ['name', 'provider', 'modelName', 'baseUrl', 'description']
+          .includes(field) &&
+        typeof body[field] !== 'string'
+      ) {
+        return `${field} 必须是字符串`;
+      }
+    }
+  } else {
+    for (const field of ['name', 'provider', 'modelName', 'baseUrl']) {
+      if (typeof body[field] !== 'string' || !body[field].trim()) {
+        return `${field} 为必填项`;
+      }
+    }
+  }
+
+  const baseUrl = body.baseUrl;
+
+  if (baseUrl !== undefined) {
+    if (typeof baseUrl !== 'string' || !baseUrl.trim()) {
+      return 'Base URL 不能为空';
+    }
+
+    try {
+      const url = new URL(baseUrl.trim());
+
+      if (
+        !['http:', 'https:'].includes(url.protocol) ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash
+      ) {
+        return 'Base URL 格式不合法';
+      }
+    } catch {
+      return 'Base URL 格式不正确';
+    }
+  }
+
+  for (const field of ['isEnabled', 'isDefault']) {
+    if (
+      body[field] !== undefined &&
+      typeof body[field] !== 'boolean'
+    ) {
+      return `${field} 必须是布尔值`;
+    }
+  }
+
+  for (const field of ['name', 'provider', 'modelName', 'baseUrl']) {
+    if (
+      typeof body[field] === 'string' &&
+      body[field].trim().length > 500
+    ) {
+      return `${field} 长度不能超过 500 个字符`;
+    }
+  }
+
+  if (
+    typeof body.description === 'string' &&
+    body.description.length > 2000
+  ) {
+    return 'description 长度不能超过 2000 个字符';
+  }
+
+  return null;
+}
+
+// ================================
 // 健康检查
+// ================================
+
 app.get('/api/health', (_req, res) => {
   res.json({
     success: true,
@@ -73,6 +188,370 @@ app.get('/api/health', (_req, res) => {
     timestamp: new Date().toISOString(),
   });
 });
+
+// ================================
+// 模型管理 API
+// 注意：当前尚无登录和管理员权限校验。
+// 仅用于本地开发测试，不可直接开放到公网。
+// ================================
+
+// 查询模型配置列表
+app.get('/api/models', (_req, res) => {
+  try {
+    const models = queryAll(
+      `SELECT id, name, provider, model_name, base_url, description,
+              is_enabled, is_default, created_at, updated_at
+       FROM model_catalog
+       ORDER BY is_default DESC, updated_at DESC`
+    ).map(formatModel);
+
+    res.json({ success: true, data: models });
+  } catch (error) {
+    console.error('查询模型失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '查询模型配置失败',
+    });
+  }
+});
+
+// 新增模型配置
+app.post('/api/models', (req, res) => {
+  try {
+    const body = req.body ?? {};
+    const validationError = validateModelInput(body);
+
+    if (validationError) {
+      return res.status(400).json({
+        success: false,
+        message: validationError,
+      });
+    }
+
+    const now = new Date().toISOString();
+    const id = randomUUID();
+
+    const name = body.name.trim();
+    const provider = body.provider.trim();
+    const modelName = body.modelName.trim();
+    const baseUrl = body.baseUrl.trim().replace(/\/+$/, '');
+    const description = (body.description ?? '').trim();
+    const isEnabled = body.isEnabled ?? true;
+    const isDefault = body.isDefault ?? false;
+
+    if (isDefault && !isEnabled) {
+      return res.status(400).json({
+        success: false,
+        message: '停用的模型不能设为默认模型',
+      });
+    }
+
+    db.run('BEGIN TRANSACTION');
+
+    try {
+      if (isDefault) {
+        db.run('UPDATE model_catalog SET is_default = 0');
+      }
+
+      db.run(
+        `INSERT INTO model_catalog
+          (id, name, provider, model_name, base_url, description,
+           is_enabled, is_default, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          name,
+          provider,
+          modelName,
+          baseUrl,
+          description,
+          isEnabled ? 1 : 0,
+          isDefault ? 1 : 0,
+          now,
+          now,
+        ]
+      );
+
+      db.run('COMMIT');
+    } catch (error) {
+      db.run('ROLLBACK');
+      throw error;
+    }
+
+    saveDatabase();
+
+    res.status(201).json({
+      success: true,
+      data: formatModel(getModel(id)),
+    });
+  } catch (error) {
+    console.error('新增模型失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '新增模型配置失败',
+    });
+  }
+});
+
+// 修改模型配置
+app.put('/api/models/:id', (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = getModel(id);
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: '模型配置不存在',
+      });
+    }
+
+    const body = req.body ?? {};
+    const validationError = validateModelInput(body, true);
+
+    if (validationError) {
+      return res.status(400).json({
+        success: false,
+        message: validationError,
+      });
+    }
+
+    const name = body.name === undefined
+      ? existing.name : body.name.trim();
+    const provider = body.provider === undefined
+      ? existing.provider : body.provider.trim();
+    const modelName = body.modelName === undefined
+      ? existing.model_name : body.modelName.trim();
+    const baseUrl = body.baseUrl === undefined
+      ? existing.base_url : body.baseUrl.trim().replace(/\/+$/, '');
+    const description = body.description === undefined
+      ? existing.description : body.description.trim();
+    const isEnabled = body.isEnabled === undefined
+      ? Boolean(existing.is_enabled) : body.isEnabled;
+    const isDefault = body.isDefault === undefined
+      ? Boolean(existing.is_default) : body.isDefault;
+
+    if (isDefault && !isEnabled) {
+      return res.status(400).json({
+        success: false,
+        message: '停用的模型不能设为默认模型',
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    db.run('BEGIN TRANSACTION');
+
+    try {
+      if (isDefault) {
+        db.run(
+          'UPDATE model_catalog SET is_default = 0 WHERE id != ?',
+          [id]
+        );
+      }
+
+      db.run(
+        `UPDATE model_catalog
+         SET name = ?, provider = ?, model_name = ?, base_url = ?,
+             description = ?, is_enabled = ?, is_default = ?,
+             updated_at = ?
+         WHERE id = ?`,
+        [
+          name,
+          provider,
+          modelName,
+          baseUrl,
+          description,
+          isEnabled ? 1 : 0,
+          isDefault ? 1 : 0,
+          now,
+          id,
+        ]
+      );
+
+      db.run('COMMIT');
+    } catch (error) {
+      db.run('ROLLBACK');
+      throw error;
+    }
+
+    saveDatabase();
+
+    res.json({
+      success: true,
+      data: formatModel(getModel(id)),
+    });
+  } catch (error) {
+    console.error('修改模型失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '修改模型配置失败',
+    });
+  }
+});
+
+// 设置平台默认模型
+app.patch('/api/models/:id/default', (req, res) => {
+  try {
+    const id = req.params.id;
+    const model = getModel(id);
+
+    if (!model) {
+      return res.status(404).json({
+        success: false,
+        message: '模型配置不存在',
+      });
+    }
+
+    if (!model.is_enabled) {
+      return res.status(400).json({
+        success: false,
+        message: '请先启用该模型，再设置为默认模型',
+      });
+    }
+
+    db.run('BEGIN TRANSACTION');
+
+    try {
+      db.run('UPDATE model_catalog SET is_default = 0');
+
+      db.run(
+        `UPDATE model_catalog
+         SET is_default = 1, updated_at = ?
+         WHERE id = ?`,
+        [new Date().toISOString(), id]
+      );
+
+      db.run('COMMIT');
+    } catch (error) {
+      db.run('ROLLBACK');
+      throw error;
+    }
+
+    saveDatabase();
+
+    res.json({
+      success: true,
+      data: formatModel(getModel(id)),
+      message: '默认模型设置成功',
+    });
+  } catch (error) {
+    console.error('设置默认模型失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '设置默认模型失败',
+    });
+  }
+});
+
+// 启用或停用模型
+app.patch('/api/models/:id/status', (req, res) => {
+  try {
+    const id = req.params.id;
+    const model = getModel(id);
+    const { isEnabled } = req.body ?? {};
+
+    if (!model) {
+      return res.status(404).json({
+        success: false,
+        message: '模型配置不存在',
+      });
+    }
+
+    if (typeof isEnabled !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'isEnabled 必须是布尔值',
+      });
+    }
+
+    if (!isEnabled && model.is_default) {
+      return res.status(400).json({
+        success: false,
+        message: '请先将其他已启用模型设为默认模型，再停用此模型',
+      });
+    }
+
+    db.run(
+      `UPDATE model_catalog
+       SET is_enabled = ?, updated_at = ?
+       WHERE id = ?`,
+      [isEnabled ? 1 : 0, new Date().toISOString(), id]
+    );
+
+    saveDatabase();
+
+    res.json({
+      success: true,
+      data: formatModel(getModel(id)),
+      message: isEnabled ? '模型已启用' : '模型已停用',
+    });
+  } catch (error) {
+    console.error('修改模型状态失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '修改模型状态失败',
+    });
+  }
+});
+
+// 删除模型配置
+app.delete('/api/models/:id', (req, res) => {
+  try {
+    const id = req.params.id;
+    const model = getModel(id);
+
+    if (!model) {
+      return res.status(404).json({
+        success: false,
+        message: '模型配置不存在',
+      });
+    }
+
+    // 避免删除后仍有 Agent 引用该模型。
+    const referencedAgent = queryOne(
+      'SELECT id FROM agents WHERE model = ? LIMIT 1',
+      [model.model_name]
+    );
+
+    if (referencedAgent) {
+      return res.status(409).json({
+        success: false,
+        message: '仍有 Agent 使用该模型，请先调整相关 Agent 的模型配置',
+      });
+    }
+
+    db.run('BEGIN TRANSACTION');
+
+    try {
+      // 显式删除关联记录，不依赖 SQLite 外键级联行为。
+      db.run('DELETE FROM model_secrets WHERE model_id = ?', [id]);
+      db.run('DELETE FROM user_model_configs WHERE model_id = ?', [id]);
+      db.run('DELETE FROM model_catalog WHERE id = ?', [id]);
+      db.run('COMMIT');
+    } catch (error) {
+      db.run('ROLLBACK');
+      throw error;
+    }
+
+    saveDatabase();
+
+    res.json({
+      success: true,
+      message: '模型配置删除成功',
+    });
+  } catch (error) {
+    console.error('删除模型失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '删除模型配置失败',
+    });
+  }
+});
+
+// ================================
+// Agent API
+// ================================
 
 // 查询所有 Agent
 app.get('/api/agents', (_req, res) => {
@@ -97,8 +576,11 @@ app.get('/api/agents', (_req, res) => {
 
     res.json({ success: true, data: agents });
   } catch (error) {
-    console.error('查询 Agent 失败：', error);
-    res.status(500).json({ success: false, message: '查询 Agent 失败' });
+    console.error('查询 Agent 失败：', error.message);
+    res.status(500).json({
+      success: false,
+      message: '查询 Agent 失败',
+    });
   }
 });
 
@@ -112,7 +594,7 @@ app.post('/api/agents', (req, res) => {
       model = '未配置',
       status = '草稿',
       systemPrompt = '',
-    } = req.body;
+    } = req.body ?? {};
 
     if (!id || !name) {
       return res.status(400).json({
@@ -137,24 +619,17 @@ app.post('/api/agents', (req, res) => {
       [id, name, description, model, status, updatedAt, systemPrompt]
     );
 
-    // 初始提示词也作为第一个版本保存。
     recordPromptVersion(id, systemPrompt);
     saveDatabase();
 
     res.status(201).json({
       success: true,
       data: {
-        id,
-        name,
-        description,
-        model,
-        status,
-        updatedAt,
-        systemPrompt,
+        id, name, description, model, status, updatedAt, systemPrompt,
       },
     });
   } catch (error) {
-    console.error('创建 Agent 失败：', error);
+    console.error('创建 Agent 失败：', error.message);
     res.status(500).json({
       success: false,
       message: '创建失败，请检查 ID 是否重复',
@@ -162,7 +637,7 @@ app.post('/api/agents', (req, res) => {
   }
 });
 
-// 修改 Agent（系统提示词变化时自动创建版本）
+// 修改 Agent
 app.put('/api/agents/:id', (req, res) => {
   try {
     const existing = getAgent(req.params.id);
@@ -180,7 +655,7 @@ app.put('/api/agents/:id', (req, res) => {
       model = '未配置',
       status = '草稿',
       systemPrompt = existing.system_prompt ?? '',
-    } = req.body;
+    } = req.body ?? {};
 
     if (!name) {
       return res.status(400).json({
@@ -222,7 +697,7 @@ app.put('/api/agents/:id', (req, res) => {
       },
     });
   } catch (error) {
-    console.error('修改 Agent 失败：', error);
+    console.error('修改 Agent 失败：', error.message);
     res.status(500).json({
       success: false,
       message: '修改 Agent 失败',
@@ -230,7 +705,7 @@ app.put('/api/agents/:id', (req, res) => {
   }
 });
 
-// 查询某个 Agent 的提示词历史版本
+// 查询提示词历史
 app.get('/api/agents/:id/prompt-versions', (req, res) => {
   try {
     if (!getAgent(req.params.id)) {
@@ -256,7 +731,7 @@ app.get('/api/agents/:id/prompt-versions', (req, res) => {
 
     res.json({ success: true, data: versions });
   } catch (error) {
-    console.error('查询提示词历史失败：', error);
+    console.error('查询提示词历史失败：', error.message);
     res.status(500).json({
       success: false,
       message: '查询提示词历史失败',
@@ -264,7 +739,7 @@ app.get('/api/agents/:id/prompt-versions', (req, res) => {
   }
 });
 
-// 手动创建历史版本快照
+// 创建提示词历史快照
 app.post('/api/agents/:id/prompt-versions', (req, res) => {
   try {
     const agent = getAgent(req.params.id);
@@ -276,8 +751,11 @@ app.post('/api/agents/:id/prompt-versions', (req, res) => {
       });
     }
 
-    const prompt = agent.system_prompt ?? '';
-    const versionNumber = recordPromptVersion(agent.id, prompt);
+    const versionNumber = recordPromptVersion(
+      agent.id,
+      agent.system_prompt ?? ''
+    );
+
     saveDatabase();
 
     const version = queryOne(
@@ -298,7 +776,7 @@ app.post('/api/agents/:id/prompt-versions', (req, res) => {
       },
     });
   } catch (error) {
-    console.error('创建提示词版本失败：', error);
+    console.error('创建提示词版本失败：', error.message);
     res.status(500).json({
       success: false,
       message: '创建提示词版本失败',
@@ -306,8 +784,7 @@ app.post('/api/agents/:id/prompt-versions', (req, res) => {
   }
 });
 
-// 回滚到指定历史版本。
-// 不覆盖历史记录，而是将恢复内容保存为一个新版本。
+// 回滚提示词：保留旧版本，并记录恢复后的新版本
 app.post('/api/agents/:id/prompt-versions/:versionId/restore', (req, res) => {
   try {
     const agent = getAgent(req.params.id);
@@ -321,8 +798,8 @@ app.post('/api/agents/:id/prompt-versions/:versionId/restore', (req, res) => {
 
     const version = queryOne(
       `SELECT id, version_number, system_prompt
-         FROM agent_prompt_versions
-         WHERE id = ? AND agent_id = ?`,
+       FROM agent_prompt_versions
+       WHERE id = ? AND agent_id = ?`,
       [Number(req.params.versionId), req.params.id]
     );
 
@@ -337,13 +814,14 @@ app.post('/api/agents/:id/prompt-versions/:versionId/restore', (req, res) => {
     const restoredPrompt = version.system_prompt ?? '';
 
     db.run(
-      `UPDATE agents
-         SET system_prompt = ?, updated_at = ?
-         WHERE id = ?`,
+      `UPDATE agents SET system_prompt = ?, updated_at = ? WHERE id = ?`,
       [restoredPrompt, updatedAt, req.params.id]
     );
 
-    const newVersionNumber = recordPromptVersion(req.params.id, restoredPrompt);
+    const newVersionNumber = recordPromptVersion(
+      req.params.id,
+      restoredPrompt
+    );
 
     saveDatabase();
 
@@ -359,7 +837,7 @@ app.post('/api/agents/:id/prompt-versions/:versionId/restore', (req, res) => {
       },
     });
   } catch (error) {
-    console.error('提示词回滚失败：', error);
+    console.error('提示词回滚失败：', error.message);
     res.status(500).json({
       success: false,
       message: '提示词回滚失败',
@@ -367,7 +845,181 @@ app.post('/api/agents/:id/prompt-versions/:versionId/restore', (req, res) => {
   }
 });
 
-// 删除 Agent，同时删除其提示词历史
+// ================================
+// 试验场：调用真实大模型
+// ================================
+
+app.post('/api/playground/chat', async (req, res) => {
+  const {
+    agentId,
+    model,
+    baseUrl,
+    apiKey,
+    systemPrompt,
+    messages,
+  } = req.body ?? {};
+
+  if (
+    typeof agentId !== 'string' || !agentId.trim() ||
+    typeof model !== 'string' || !model.trim() ||
+    typeof baseUrl !== 'string' || !baseUrl.trim() ||
+    typeof apiKey !== 'string' || !apiKey.trim() ||
+    !Array.isArray(messages) || messages.length === 0
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: '请填写 Agent、模型名称、Base URL、API Key 和测试消息',
+    });
+  }
+
+  const agent = getAgent(agentId.trim());
+
+  if (!agent) {
+    return res.status(404).json({
+      success: false,
+      message: 'Agent 不存在，请刷新页面后重试',
+    });
+  }
+
+  let endpoint;
+
+  try {
+    const parsedUrl = new URL(baseUrl.trim());
+
+    if (
+      !['http:', 'https:'].includes(parsedUrl.protocol) ||
+      parsedUrl.username ||
+      parsedUrl.password ||
+      parsedUrl.search ||
+      parsedUrl.hash
+    ) {
+      throw new Error('URL 不合法');
+    }
+
+    endpoint = `${parsedUrl.href.replace(/\/+$/, '')}/chat/completions`;
+  } catch {
+    return res.status(400).json({
+      success: false,
+      message: 'Base URL 格式不正确',
+    });
+  }
+
+  if (messages.length > 50) {
+    return res.status(400).json({
+      success: false,
+      message: '单次最多发送 50 条历史消息',
+    });
+  }
+
+  const normalizedMessages = [];
+
+  for (const message of messages) {
+    if (
+      !message ||
+      !['user', 'assistant'].includes(message.role) ||
+      typeof message.content !== 'string' ||
+      !message.content.trim() ||
+      message.content.length > 20000
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: '对话消息格式不正确或内容过长',
+      });
+    }
+
+    normalizedMessages.push({
+      role: message.role,
+      content: message.content,
+    });
+  }
+
+  const effectivePrompt = typeof systemPrompt === 'string'
+    ? systemPrompt
+    : agent.system_prompt ?? '';
+
+  if (effectivePrompt.length > 30000) {
+    return res.status(400).json({
+      success: false,
+      message: 'System Prompt 不能超过 30000 个字符',
+    });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey.trim()}`,
+      },
+      body: JSON.stringify({
+        model: model.trim(),
+        messages: [
+          ...(effectivePrompt.trim()
+            ? [{ role: 'system', content: effectivePrompt }]
+            : []),
+          ...normalizedMessages,
+        ],
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    const result = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      console.error('模型调用失败，HTTP 状态码：', response.status);
+
+      return res.status(502).json({
+        success: false,
+        message:
+          response.status === 401 || response.status === 403
+            ? '模型认证失败，请检查 API Key 或账号权限'
+            : response.status === 429
+              ? '模型服务限流或额度不足，请稍后重试'
+              : `模型服务请求失败（HTTP ${response.status}）`,
+      });
+    }
+
+    const content = result?.choices?.[0]?.message?.content;
+
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(502).json({
+        success: false,
+        message: '模型返回内容为空或响应格式不符合 OpenAI 兼容协议',
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        content,
+        model: result.model ?? model.trim(),
+        usage: result.usage ?? null,
+      },
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      return res.status(504).json({
+        success: false,
+        message: '模型请求超时，请稍后重试',
+      });
+    }
+
+    console.error('模型请求异常：', error?.message ?? '未知错误');
+
+    return res.status(502).json({
+      success: false,
+      message: '无法连接模型服务，请检查 Base URL 和网络连接',
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+// 删除 Agent 和其提示词历史
 app.delete('/api/agents/:id', (req, res) => {
   try {
     if (!getAgent(req.params.id)) {
@@ -386,7 +1038,7 @@ app.delete('/api/agents/:id', (req, res) => {
 
     res.json({ success: true, message: '删除成功' });
   } catch (error) {
-    console.error('删除 Agent 失败：', error);
+    console.error('删除 Agent 失败：', error.message);
     res.status(500).json({
       success: false,
       message: '删除 Agent 失败',
