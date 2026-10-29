@@ -1,7 +1,16 @@
 
 import express from 'express';
 import { randomUUID } from 'node:crypto';
+import authRouter from './routes/auth.js';
+import { requireAuth, requireAdmin } from './middleware/auth.js';
 import { db, saveDatabase } from './db.js';
+import {
+  queryAll,
+  queryOne,
+  getAgent,
+  getModel,
+  formatModel,
+} from './utils/db-query.js';
 
 const app = express();
 const PORT = 3001;
@@ -9,63 +18,28 @@ const PORT = 3001;
 app.use(express.json({ limit: '1mb' }));
 
 // ================================
+// 认证路由：登录、登出、当前用户
+// ================================
+app.use('/api/auth', authRouter);
+
+// ================================
+// 公开健康检查
+// ================================
+app.get('/api/health', (_req, res) => {
+  res.json({
+    success: true,
+    message: 'Agent Studio 后端运行正常',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// 其余业务 API 必须先登录。
+// 此中间件之后注册的业务路由均受到登录保护。
+app.use('/api', requireAuth);
+
+// ================================
 // 通用数据库工具
 // ================================
-
-function queryAll(sql, params = []) {
-  const statement = db.prepare(sql);
-
-  try {
-    statement.bind(params);
-    const rows = [];
-
-    while (statement.step()) {
-      rows.push(statement.getAsObject());
-    }
-
-    return rows;
-  } finally {
-    statement.free();
-  }
-}
-
-function queryOne(sql, params = []) {
-  return queryAll(sql, params)[0] ?? null;
-}
-
-function getAgent(id) {
-  return queryOne(
-    `SELECT id, name, description, model, status, updated_at, system_prompt
-     FROM agents WHERE id = ?`,
-    [id]
-  );
-}
-
-function getModel(id) {
-  return queryOne(
-    `SELECT id, name, provider, model_name, base_url, description,
-            is_enabled, is_default, created_at, updated_at
-     FROM model_catalog WHERE id = ?`,
-    [id]
-  );
-}
-
-function formatModel(row) {
-  if (!row) return null;
-
-  return {
-    id: row.id,
-    name: row.name,
-    provider: row.provider,
-    modelName: row.model_name,
-    baseUrl: row.base_url,
-    description: row.description,
-    isEnabled: Boolean(row.is_enabled),
-    isDefault: Boolean(row.is_default),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
 
 function recordPromptVersion(agentId, prompt) {
   const latest = queryOne(
@@ -178,24 +152,11 @@ function validateModelInput(body, partial = false) {
 }
 
 // ================================
-// 健康检查
-// ================================
-
-app.get('/api/health', (_req, res) => {
-  res.json({
-    success: true,
-    message: 'Agent Studio 后端运行正常',
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// ================================
 // 模型管理 API
-// 注意：当前尚无登录和管理员权限校验。
-// 仅用于本地开发测试，不可直接开放到公网。
+// 所有接口要求登录；写操作额外要求管理员权限。
 // ================================
 
-// 查询模型配置列表
+// 查询模型配置列表：登录用户可访问
 app.get('/api/models', (_req, res) => {
   try {
     const models = queryAll(
@@ -215,8 +176,8 @@ app.get('/api/models', (_req, res) => {
   }
 });
 
-// 新增模型配置
-app.post('/api/models', (req, res) => {
+// 新增模型配置：管理员
+app.post('/api/models', requireAdmin, (req, res) => {
   try {
     const body = req.body ?? {};
     const validationError = validateModelInput(body);
@@ -293,8 +254,8 @@ app.post('/api/models', (req, res) => {
   }
 });
 
-// 修改模型配置
-app.put('/api/models/:id', (req, res) => {
+// 修改模型配置：管理员
+app.put('/api/models/:id', requireAdmin, (req, res) => {
   try {
     const id = req.params.id;
     const existing = getModel(id);
@@ -390,8 +351,8 @@ app.put('/api/models/:id', (req, res) => {
   }
 });
 
-// 设置平台默认模型
-app.patch('/api/models/:id/default', (req, res) => {
+// 设置平台默认模型：管理员
+app.patch('/api/models/:id/default', requireAdmin, (req, res) => {
   try {
     const id = req.params.id;
     const model = getModel(id);
@@ -444,8 +405,8 @@ app.patch('/api/models/:id/default', (req, res) => {
   }
 });
 
-// 启用或停用模型
-app.patch('/api/models/:id/status', (req, res) => {
+// 启用或停用模型：管理员
+app.patch('/api/models/:id/status', requireAdmin, (req, res) => {
   try {
     const id = req.params.id;
     const model = getModel(id);
@@ -495,8 +456,8 @@ app.patch('/api/models/:id/status', (req, res) => {
   }
 });
 
-// 删除模型配置
-app.delete('/api/models/:id', (req, res) => {
+// 删除模型配置：管理员
+app.delete('/api/models/:id', requireAdmin, (req, res) => {
   try {
     const id = req.params.id;
     const model = getModel(id);
@@ -508,7 +469,6 @@ app.delete('/api/models/:id', (req, res) => {
       });
     }
 
-    // 避免删除后仍有 Agent 引用该模型。
     const referencedAgent = queryOne(
       'SELECT id FROM agents WHERE model = ? LIMIT 1',
       [model.model_name]
@@ -524,7 +484,6 @@ app.delete('/api/models/:id', (req, res) => {
     db.run('BEGIN TRANSACTION');
 
     try {
-      // 显式删除关联记录，不依赖 SQLite 外键级联行为。
       db.run('DELETE FROM model_secrets WHERE model_id = ?', [id]);
       db.run('DELETE FROM user_model_configs WHERE model_id = ?', [id]);
       db.run('DELETE FROM model_catalog WHERE id = ?', [id]);
@@ -553,7 +512,7 @@ app.delete('/api/models/:id', (req, res) => {
 // Agent API
 // ================================
 
-// 查询所有 Agent
+// 查询所有 Agent：登录用户
 app.get('/api/agents', (_req, res) => {
   try {
     const result = db.exec(`
@@ -584,8 +543,8 @@ app.get('/api/agents', (_req, res) => {
   }
 });
 
-// 创建 Agent
-app.post('/api/agents', (req, res) => {
+// 创建 Agent：管理员
+app.post('/api/agents', requireAdmin, (req, res) => {
   try {
     const {
       id,
@@ -625,7 +584,13 @@ app.post('/api/agents', (req, res) => {
     res.status(201).json({
       success: true,
       data: {
-        id, name, description, model, status, updatedAt, systemPrompt,
+        id,
+        name,
+        description,
+        model,
+        status,
+        updatedAt,
+        systemPrompt,
       },
     });
   } catch (error) {
@@ -637,8 +602,8 @@ app.post('/api/agents', (req, res) => {
   }
 });
 
-// 修改 Agent
-app.put('/api/agents/:id', (req, res) => {
+// 修改 Agent：管理员
+app.put('/api/agents/:id', requireAdmin, (req, res) => {
   try {
     const existing = getAgent(req.params.id);
 
@@ -678,7 +643,15 @@ app.put('/api/agents/:id', (req, res) => {
        SET name = ?, description = ?, model = ?, status = ?,
            updated_at = ?, system_prompt = ?
        WHERE id = ?`,
-      [name, description, model, status, updatedAt, systemPrompt, req.params.id]
+      [
+        name,
+        description,
+        model,
+        status,
+        updatedAt,
+        systemPrompt,
+        req.params.id,
+      ]
     );
 
     recordPromptVersion(req.params.id, systemPrompt);
@@ -705,7 +678,7 @@ app.put('/api/agents/:id', (req, res) => {
   }
 });
 
-// 查询提示词历史
+// 查询提示词历史：登录用户
 app.get('/api/agents/:id/prompt-versions', (req, res) => {
   try {
     if (!getAgent(req.params.id)) {
@@ -739,114 +712,134 @@ app.get('/api/agents/:id/prompt-versions', (req, res) => {
   }
 });
 
-// 创建提示词历史快照
-app.post('/api/agents/:id/prompt-versions', (req, res) => {
-  try {
-    const agent = getAgent(req.params.id);
+// 创建提示词历史快照：管理员
+app.post(
+  '/api/agents/:id/prompt-versions',
+  requireAdmin,
+  (req, res) => {
+    try {
+      const agent = getAgent(req.params.id);
 
-    if (!agent) {
-      return res.status(404).json({
+      if (!agent) {
+        return res.status(404).json({
+          success: false,
+          message: 'Agent 不存在',
+        });
+      }
+
+      const versionNumber = recordPromptVersion(
+        agent.id,
+        agent.system_prompt ?? ''
+      );
+
+      saveDatabase();
+
+      const version = queryOne(
+        `SELECT id, agent_id, version_number, system_prompt, created_at
+         FROM agent_prompt_versions
+         WHERE agent_id = ? AND version_number = ?`,
+        [agent.id, versionNumber]
+      );
+
+      res.status(201).json({
+        success: true,
+        data: {
+          id: version.id,
+          agentId: version.agent_id,
+          versionNumber: version.version_number,
+          systemPrompt: version.system_prompt,
+          createdAt: version.created_at,
+        },
+      });
+    } catch (error) {
+      console.error('创建提示词版本失败：', error.message);
+      res.status(500).json({
         success: false,
-        message: 'Agent 不存在',
+        message: '创建提示词版本失败',
       });
     }
-
-    const versionNumber = recordPromptVersion(
-      agent.id,
-      agent.system_prompt ?? ''
-    );
-
-    saveDatabase();
-
-    const version = queryOne(
-      `SELECT id, agent_id, version_number, system_prompt, created_at
-       FROM agent_prompt_versions
-       WHERE agent_id = ? AND version_number = ?`,
-      [agent.id, versionNumber]
-    );
-
-    res.status(201).json({
-      success: true,
-      data: {
-        id: version.id,
-        agentId: version.agent_id,
-        versionNumber: version.version_number,
-        systemPrompt: version.system_prompt,
-        createdAt: version.created_at,
-      },
-    });
-  } catch (error) {
-    console.error('创建提示词版本失败：', error.message);
-    res.status(500).json({
-      success: false,
-      message: '创建提示词版本失败',
-    });
   }
-});
+);
 
-// 回滚提示词：保留旧版本，并记录恢复后的新版本
-app.post('/api/agents/:id/prompt-versions/:versionId/restore', (req, res) => {
-  try {
-    const agent = getAgent(req.params.id);
+// 回滚提示词：管理员
+app.post(
+  '/api/agents/:id/prompt-versions/:versionId/restore',
+  requireAdmin,
+  (req, res) => {
+    try {
+      const agent = getAgent(req.params.id);
 
-    if (!agent) {
-      return res.status(404).json({
+      if (!agent) {
+        return res.status(404).json({
+          success: false,
+          message: 'Agent 不存在',
+        });
+      }
+
+      const versionId = Number(req.params.versionId);
+
+      if (!Number.isSafeInteger(versionId) || versionId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: '历史版本 ID 不合法',
+        });
+      }
+
+      const version = queryOne(
+        `SELECT id, version_number, system_prompt
+         FROM agent_prompt_versions
+         WHERE id = ? AND agent_id = ?`,
+        [versionId, req.params.id]
+      );
+
+      if (!version) {
+        return res.status(404).json({
+          success: false,
+          message: '指定的历史版本不存在',
+        });
+      }
+
+      const updatedAt = new Date().toISOString().slice(0, 10);
+      const restoredPrompt = version.system_prompt ?? '';
+
+      db.run(
+        `UPDATE agents
+         SET system_prompt = ?, updated_at = ?
+         WHERE id = ?`,
+        [restoredPrompt, updatedAt, req.params.id]
+      );
+
+      const newVersionNumber = recordPromptVersion(
+        req.params.id,
+        restoredPrompt
+      );
+
+      saveDatabase();
+
+      res.json({
+        success: true,
+        message: '提示词回滚成功',
+        data: {
+          agentId: req.params.id,
+          restoredFromVersion: version.version_number,
+          currentVersion: newVersionNumber,
+          systemPrompt: restoredPrompt,
+          updatedAt,
+        },
+      });
+    } catch (error) {
+      console.error('提示词回滚失败：', error.message);
+      res.status(500).json({
         success: false,
-        message: 'Agent 不存在',
+        message: '提示词回滚失败',
       });
     }
-
-    const version = queryOne(
-      `SELECT id, version_number, system_prompt
-       FROM agent_prompt_versions
-       WHERE id = ? AND agent_id = ?`,
-      [Number(req.params.versionId), req.params.id]
-    );
-
-    if (!version) {
-      return res.status(404).json({
-        success: false,
-        message: '指定的历史版本不存在',
-      });
-    }
-
-    const updatedAt = new Date().toISOString().slice(0, 10);
-    const restoredPrompt = version.system_prompt ?? '';
-
-    db.run(
-      `UPDATE agents SET system_prompt = ?, updated_at = ? WHERE id = ?`,
-      [restoredPrompt, updatedAt, req.params.id]
-    );
-
-    const newVersionNumber = recordPromptVersion(
-      req.params.id,
-      restoredPrompt
-    );
-
-    saveDatabase();
-
-    res.json({
-      success: true,
-      message: '提示词回滚成功',
-      data: {
-        agentId: req.params.id,
-        restoredFromVersion: version.version_number,
-        currentVersion: newVersionNumber,
-        systemPrompt: restoredPrompt,
-        updatedAt,
-      },
-    });
-  } catch (error) {
-    console.error('提示词回滚失败：', error.message);
-    res.status(500).json({
-      success: false,
-      message: '提示词回滚失败',
-    });
   }
-});
+);
 
 // ================================
 // 试验场：调用真实大模型
+// 要求登录，暂不要求管理员权限。
 // ================================
 
 app.post('/api/playground/chat', async (req, res) => {
@@ -1019,8 +1012,8 @@ app.post('/api/playground/chat', async (req, res) => {
   }
 });
 
-// 删除 Agent 和其提示词历史
-app.delete('/api/agents/:id', (req, res) => {
+// 删除 Agent 和其提示词历史：管理员
+app.delete('/api/agents/:id', requireAdmin, (req, res) => {
   try {
     if (!getAgent(req.params.id)) {
       return res.status(404).json({
@@ -1032,11 +1025,15 @@ app.delete('/api/agents/:id', (req, res) => {
     db.run('DELETE FROM agent_prompt_versions WHERE agent_id = ?', [
       req.params.id,
     ]);
+
     db.run('DELETE FROM agents WHERE id = ?', [req.params.id]);
 
     saveDatabase();
 
-    res.json({ success: true, message: '删除成功' });
+    res.json({
+      success: true,
+      message: '删除成功',
+    });
   } catch (error) {
     console.error('删除 Agent 失败：', error.message);
     res.status(500).json({
@@ -1045,6 +1042,10 @@ app.delete('/api/agents/:id', (req, res) => {
     });
   }
 });
+
+// ================================
+// 启动服务
+// ================================
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Agent Studio API 已启动：http://localhost:${PORT}`);

@@ -80,7 +80,7 @@ db.run(`
 
 // ================================
 // 3. 平台模型配置表
-// 保存模型基本信息，不保存明文 API Key。
+// 不保存明文 API Key。
 // ================================
 
 db.run(`
@@ -107,8 +107,8 @@ db.run(`
 
 // ================================
 // 4. 模型密钥表
-// 预留加密后的 API Key 存储。
-// 当前版本不会自动加密或写入密钥。
+// 仅用于存储后续实现的加密密钥。
+// 不能直接把明文 API Key 写入此表。
 // ================================
 
 db.run(`
@@ -125,8 +125,7 @@ db.run(`
 
 // ================================
 // 5. 用户模型关联表
-// 为后续注册、权限隔离和个人默认模型预留。
-// 当前项目尚未实现用户认证。
+// 为用户个人模型配置预留。
 // ================================
 
 db.run(`
@@ -150,7 +149,101 @@ db.run(`
 `);
 
 // ================================
-// 6. 数据库持久化
+// 6. 用户账号表
+// 密码只存安全哈希，不存明文。
+// role 由后端控制，不能信任前端传值。
+// ================================
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    email TEXT COLLATE NOCASE UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user'
+      CHECK (role IN ('user', 'admin')),
+    status TEXT NOT NULL DEFAULT 'active'
+      CHECK (status IN ('active', 'disabled')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_login_at TEXT
+  )
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_users_role_status
+  ON users (role, status)
+`);
+
+// ================================
+// 7. 邀请码表
+// 只存邀请码的哈希，不存可直接使用的明文令牌。
+// created_by 为创建邀请的管理员。
+// used_by 为成功使用邀请的用户。
+// ================================
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS invitations (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL,
+    used_by TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    revoked_at TEXT,
+    FOREIGN KEY (created_by)
+      REFERENCES users (id)
+      ON DELETE RESTRICT,
+    FOREIGN KEY (used_by)
+      REFERENCES users (id)
+      ON DELETE RESTRICT
+  )
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_invitations_creator
+  ON invitations (created_by, created_at)
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_invitations_expiry
+  ON invitations (expires_at, used_at, revoked_at)
+`);
+
+// ================================
+// 8. 登录会话表
+// 只存会话令牌的哈希。
+// 支持过期、退出登录和主动撤销。
+// ================================
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_seen_at TEXT,
+    revoked_at TEXT,
+    FOREIGN KEY (user_id)
+      REFERENCES users (id)
+      ON DELETE CASCADE
+  )
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_sessions_user
+  ON sessions (user_id, created_at)
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_sessions_expiry
+  ON sessions (expires_at, revoked_at)
+`);
+
+// ================================
+// 9. 数据库持久化
 // ================================
 
 function saveDatabase() {
@@ -163,7 +256,7 @@ function closeDatabase() {
   db.close();
 }
 
-// 保存数据库初始化结果。
+// 保存新增表结构及数据库初始化结果。
 saveDatabase();
 
 export { db, saveDatabase, closeDatabase };

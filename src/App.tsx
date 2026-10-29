@@ -1,6 +1,9 @@
+
 import { useEffect, useMemo, useState } from 'react';
 import './App.css';
 import { type Agent, type AgentStatus } from './data/mock';
+
+
 import {
   getAgents,
   createAgentApi,
@@ -8,13 +11,30 @@ import {
   deleteAgentApi,
   getPromptVersionsApi,
   restorePromptVersionApi,
+  getModelsApi,
+  createModelApi,
+  updateModelApi,
+  setDefaultModelApi,
+  setModelStatusApi,
+  deleteModelApi,
+  getCurrentUserApi,
+  loginApi,
+  registerApi,
+  logoutApi,
+  type AuthUser,
   type PromptVersion,
+  type ModelConfig,
+  type ModelInput,
 } from './api';
+
+
 import Playground from './Playground';
+
 const navigation = [
   { id: 'overview', label: '总览', icon: '◫' },
   { id: 'agents', label: 'Agents', icon: '◇' },
   { id: 'playground', label: '试验场', icon: '▷' },
+  { id: 'models', label: '模型管理', icon: '◉' },
   { id: 'skills', label: 'Skills', icon: '⌘' },
   { id: 'runs', label: '运行记录', icon: '≋' },
   { id: 'settings', label: '系统设置', icon: '⚙' },
@@ -27,20 +47,29 @@ const descriptions: Record<PageId, string> = {
   overview: '查看 Agent 平台的运行状态和关键指标',
   agents: '创建、配置和管理你的智能体',
   playground: '在这里测试 Agent 的提示词和执行效果',
+  models: '管理平台模型配置、默认模型和模型启用状态',
   skills: '管理可供 Agent 调用的工具与技能',
   runs: '查看历史执行记录与运行结果',
   settings: '管理平台的基础配置',
   agentDetail: '查看智能体的基本信息与当前配置',
 };
 
+// ==================== 侧边栏 ====================
+
+// ==================== 侧边栏 ====================
+
 function Sidebar({
   activePage,
   onNavigate,
   agentCount,
+  currentUser,
+  onLogout,
 }: {
   activePage: PageId;
   onNavigate: (page: PageId) => void;
   agentCount: number;
+  currentUser: AuthUser;
+  onLogout: () => void;
 }) {
   return (
     <aside className="sidebar">
@@ -53,6 +82,7 @@ function Sidebar({
       </div>
 
       <div className="nav-label">工作空间</div>
+
       <nav className="nav-list">
         {navigation.map((item) => (
           <button
@@ -67,6 +97,7 @@ function Sidebar({
           >
             <span className="nav-icon">{item.icon}</span>
             <span>{item.label}</span>
+
             {item.id === 'agents' && (
               <span className="nav-count">{agentCount}</span>
             )}
@@ -82,53 +113,290 @@ function Sidebar({
             <div className="workspace-subtitle">本地演示环境</div>
           </div>
         </div>
+
         <div className="user-profile">
-          <div className="avatar">U</div>
-          <div className="user-info">
-            <div className="user-name">Workspace User</div>
-            <div className="user-role">管理员</div>
+          <div className="avatar">
+            {(currentUser.username || 'U').slice(0, 1).toUpperCase()}
           </div>
-          <span className="user-more">···</span>
+
+          <div className="user-info">
+            <div className="user-name" title={currentUser.username}>
+              {currentUser.username}
+            </div>
+
+            <div className="user-role">
+              {currentUser.role === 'admin' ? '管理员' : '普通用户'}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            className="user-more"
+            title="退出登录"
+            aria-label="退出登录"
+            onClick={onLogout}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              color: 'inherit',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+              fontSize: '12px',
+            }}
+          >
+            退出
+          </button>
         </div>
       </div>
     </aside>
   );
 }
 
+// ==================== 顶部栏 ====================
+
+// ==================== 顶部栏 ====================
+
 function Topbar({
   activePage,
   onMenuClick,
+  currentUser,
 }: {
   activePage: PageId;
   onMenuClick: () => void;
+  currentUser: AuthUser;
 }) {
   const current = navigation.find((item) => item.id === activePage);
+
   const pageLabel =
     activePage === 'agentDetail' ? 'Agent 详情' : current?.label;
 
   return (
     <header className="topbar">
-      <button className="mobile-menu-button" onClick={onMenuClick}>
+      <button
+        className="mobile-menu-button"
+        onClick={onMenuClick}
+        aria-label="打开菜单"
+      >
         ☰
       </button>
+
       <div className="breadcrumbs">
         <span>工作空间</span>
         <span className="breadcrumb-separator">/</span>
         <strong>{pageLabel}</strong>
       </div>
+
       <div className="topbar-actions">
         <div className="environment-badge">
           <span className="status-dot" />
           本地演示
         </div>
-        <button className="icon-button" title="通知">
+
+        <button className="icon-button" title="通知" type="button">
           ♧
         </button>
-        <div className="topbar-avatar">U</div>
+
+        <div
+          className="topbar-avatar"
+          title={currentUser.username}
+          aria-label={`当前用户：${currentUser.username}`}
+        >
+          {(currentUser.username || 'U').slice(0, 1).toUpperCase()}
+        </div>
       </div>
     </header>
   );
 }
+
+type AuthScreenProps = {
+  onLogin: (username: string, password: string) => Promise<void>;
+  onRegister: (input: {
+    username: string;
+    email: string;
+    password: string;
+    invitationCode: string;
+  }) => Promise<void>;
+};
+
+function AuthScreen({ onLogin, onRegister }: AuthScreenProps) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [invitationCode, setInvitationCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+
+  async function submitForm(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy) return;
+
+    setBusy(true);
+    setError('');
+    setMessage('');
+
+    try {
+      if (mode === 'login') {
+        await onLogin(username.trim(), password);
+      } else {
+        await onRegister({
+          username: username.trim(),
+          email: email.trim(),
+          password,
+          invitationCode: invitationCode.trim(),
+        });
+        setMode('login');
+        setPassword('');
+        setInvitationCode('');
+        setMessage('注册成功，请使用新账号登录。');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '操作失败，请重试。');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: '100vh',
+        display: 'grid',
+        placeItems: 'center',
+        padding: 24,
+        boxSizing: 'border-box',
+        background: 'var(--app-bg, #f5f6fa)',
+      }}
+    >
+      <div
+        className="panel"
+        style={{
+          width: '100%',
+          maxWidth: 420,
+          boxSizing: 'border-box',
+          padding: 32,
+          borderRadius: 16,
+        }}
+      >
+        <div style={{ textAlign: 'center', marginBottom: 28 }}>
+          <div
+            className="brand-mark"
+            style={{ margin: '0 auto 16px', width: 48, height: 48 }}
+          >
+            A
+          </div>
+          <h1 style={{ margin: '0 0 8px' }}>Agent Studio</h1>
+          <p style={{ color: '#64748b', margin: 0 }}>
+            {mode === 'login' ? '登录你的工作空间' : '使用邀请码创建账号'}
+          </p>
+        </div>
+
+        <form onSubmit={submitForm}>
+          <label className="form-field">
+            <span>用户名{mode === 'login' ? ' / 邮箱' : ''}</span>
+            <input
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              placeholder={mode === 'login' ? '输入用户名或邮箱' : '3-32 位字母、数字、下划线或连字符'}
+              autoComplete="username"
+              required
+              maxLength={mode === 'login' ? 254 : 32}
+            />
+          </label>
+
+          {mode === 'register' && (
+            <>
+              <label className="form-field">
+                <span>邮箱</span>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="name@example.com"
+                  autoComplete="email"
+                  maxLength={254}
+                  required
+                />
+              </label>
+
+              <label className="form-field">
+                <span>邀请码</span>
+                <input
+                  value={invitationCode}
+                  onChange={(event) => setInvitationCode(event.target.value)}
+                  placeholder="输入管理员提供的邀请码"
+                  autoComplete="off"
+                  minLength={20}
+                  maxLength={200}
+                  required
+                />
+              </label>
+            </>
+          )}
+
+          <label className="form-field">
+            <span>密码</span>
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder={mode === 'register' ? '至少 12 个字符' : '输入密码'}
+              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+              minLength={mode === 'register' ? 12 : undefined}
+              maxLength={1024}
+              required
+            />
+          </label>
+
+          {message && (
+            <div role="status" style={{ color: 'green', margin: '12px 0' }}>
+              {message}
+            </div>
+          )}
+
+          {error && (
+            <div role="alert" className="form-error" style={{ margin: '12px 0' }}>
+              {error}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            className="primary-button"
+            disabled={busy}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 12 }}
+          >
+            {busy
+              ? '处理中...'
+              : mode === 'login'
+                ? '登录'
+                : '注册账号'}
+          </button>
+        </form>
+
+        <div style={{ textAlign: 'center', marginTop: 22, color: '#64748b' }}>
+          {mode === 'login' ? '还没有账号？' : '已有账号？'}
+          <button
+            type="button"
+            className="text-button"
+            disabled={busy}
+            style={{ marginLeft: 6 }}
+            onClick={() => {
+              setMode(mode === 'login' ? 'register' : 'login');
+              setError('');
+              setMessage('');
+            }}
+          >
+            {mode === 'login' ? '邀请码注册' : '返回登录'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== 总览 ====================
 
 function Overview({
   onNavigate,
@@ -153,8 +421,8 @@ function Overview({
       change: loading
         ? '正在读取数据库'
         : error
-        ? '加载失败，请检查后端'
-        : '数据库中的 Agent 总数',
+          ? '加载失败，请检查后端'
+          : '数据库中的 Agent 总数',
       icon: '◇',
     },
     {
@@ -163,8 +431,8 @@ function Overview({
       change: loading
         ? '正在读取数据库'
         : error
-        ? '加载失败，请检查后端'
-        : '当前状态为运行中的 Agent',
+          ? '加载失败，请检查后端'
+          : '当前状态为运行中的 Agent',
       icon: '▷',
     },
     {
@@ -336,6 +604,17 @@ function Overview({
             </span>
             <span className="quick-arrow">→</span>
           </button>
+          <button
+            className="quick-action"
+            onClick={() => onNavigate('models')}
+          >
+            <span className="quick-icon blue-bg">◉</span>
+            <span className="quick-copy">
+              <strong>管理模型</strong>
+              <small>配置模型与默认模型</small>
+            </span>
+            <span className="quick-arrow">→</span>
+          </button>
         </div>
       </section>
 
@@ -401,6 +680,8 @@ function Overview({
     </>
   );
 }
+
+// ==================== Agent 管理 ====================
 
 function AgentManagement({
   agents,
@@ -530,8 +811,8 @@ function AgentManagement({
                         agent.status === '运行中'
                           ? 'running'
                           : agent.status === '已停用'
-                          ? 'stopped'
-                          : 'draft'
+                            ? 'stopped'
+                            : 'draft'
                       }`}
                     >
                       <i />
@@ -585,6 +866,8 @@ function AgentManagement({
   );
 }
 
+// ==================== Agent 详情与提示词历史 ====================
+
 function AgentDetail({
   agent,
   onBack,
@@ -604,8 +887,8 @@ function AgentDetail({
     agent.status === '运行中'
       ? 'running'
       : agent.status === '已停用'
-      ? 'stopped'
-      : 'draft';
+        ? 'stopped'
+        : 'draft';
 
   const [systemPrompt, setSystemPrompt] = useState(agent.systemPrompt ?? '');
   const [saving, setSaving] = useState(false);
@@ -1009,6 +1292,8 @@ function AgentDetail({
   );
 }
 
+// ==================== Agent 表单 ====================
+
 function AgentFormModal({
   initialAgent,
   title,
@@ -1147,6 +1432,377 @@ function AgentFormModal({
   );
 }
 
+// ==================== 模型管理 ====================
+
+function ModelManagement({
+  models,
+  loading,
+  error,
+  onRefresh,
+  onCreate,
+  onEdit,
+  onSetDefault,
+  onToggle,
+  onDelete,
+}: {
+  models: ModelConfig[];
+  loading: boolean;
+  error: string;
+  onRefresh: () => void;
+  onCreate: () => void;
+  onEdit: (model: ModelConfig) => void;
+  onSetDefault: (model: ModelConfig) => void;
+  onToggle: (model: ModelConfig) => void;
+  onDelete: (model: ModelConfig) => void;
+}) {
+  const [keyword, setKeyword] = useState('');
+
+  const filteredModels = models.filter((model) => {
+    const search = keyword.trim().toLowerCase();
+
+    return (
+      !search ||
+      model.name.toLowerCase().includes(search) ||
+      model.provider.toLowerCase().includes(search) ||
+      model.modelName.toLowerCase().includes(search)
+    );
+  });
+
+  return (
+    <section className="agent-management">
+      <div className="agent-page-heading">
+        <div>
+          <h1>模型管理</h1>
+          <p>统一管理平台模型配置、默认模型及启用状态。</p>
+        </div>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            className="secondary-button"
+            onClick={onRefresh}
+            disabled={loading}
+          >
+            刷新
+          </button>
+          <button className="primary-button" onClick={onCreate}>
+            ＋ 添加模型
+          </button>
+        </div>
+      </div>
+
+      <div className="agent-summary-grid">
+        <div className="agent-summary-card">
+          <span>模型总数</span>
+          <strong>{models.length}</strong>
+        </div>
+        <div className="agent-summary-card">
+          <span>已启用</span>
+          <strong>{models.filter((model) => model.isEnabled).length}</strong>
+        </div>
+        <div className="agent-summary-card">
+          <span>已停用</span>
+          <strong>{models.filter((model) => !model.isEnabled).length}</strong>
+        </div>
+        <div className="agent-summary-card">
+          <span>默认模型</span>
+          <strong style={{ fontSize: 14, overflowWrap: 'anywhere' }}>
+            {models.find((model) => model.isDefault)?.name ?? '未设置'}
+          </strong>
+        </div>
+      </div>
+
+      <div className="panel agent-list-panel">
+        <div className="agent-toolbar">
+          <div className="agent-search">
+            <span>⌕</span>
+            <input
+              value={keyword}
+              onChange={(event) => setKeyword(event.target.value)}
+              placeholder="搜索模型名称、提供方或模型标识..."
+            />
+          </div>
+        </div>
+
+        {error && (
+          <div className="agent-empty">
+            <strong>模型操作失败</strong>
+            <p>{error}</p>
+            <button className="secondary-button" onClick={onRefresh}>
+              重新加载
+            </button>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="agent-empty">
+            <strong>正在加载模型配置...</strong>
+          </div>
+        ) : !error && filteredModels.length === 0 ? (
+          <div className="agent-empty">
+            <div className="agent-empty-icon">◉</div>
+            <strong>
+              {models.length === 0 ? '还没有模型配置' : '没有匹配的模型'}
+            </strong>
+            <p>添加模型后，就可以在这里设置默认模型和管理状态。</p>
+          </div>
+        ) : !error ? (
+          <div className="agent-card-list">
+            {filteredModels.map((model) => (
+              <article className="agent-card" key={model.id}>
+                <div className="agent-card-icon">◉</div>
+
+                <div className="agent-card-main">
+                  <div className="agent-card-title-row">
+                    <h3>{model.name}</h3>
+
+                    {model.isDefault && (
+                      <span className="run-status success">默认模型</span>
+                    )}
+
+                    <span
+                      className={`agent-status ${
+                        model.isEnabled ? 'status-running' : 'status-stopped'
+                      }`}
+                    >
+                      <i />
+                      {model.isEnabled ? '已启用' : '已停用'}
+                    </span>
+                  </div>
+
+                  <p>{model.description || '暂无描述'}</p>
+
+                  <div className="agent-card-meta">
+                    <span>
+                      <i>AI</i> 提供方：{model.provider}
+                    </span>
+                    <span>模型标识：{model.modelName}</span>
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 10,
+                      fontSize: 12,
+                      color: 'var(--text-secondary, #64748b)',
+                      overflowWrap: 'anywhere',
+                    }}
+                  >
+                    Base URL：{model.baseUrl}
+                  </div>
+                </div>
+
+                <div
+                  className="agent-card-actions"
+                  style={{ flexWrap: 'wrap' }}
+                >
+                  {!model.isDefault && model.isEnabled && (
+                    <button
+                      className="secondary-button"
+                      onClick={() => onSetDefault(model)}
+                    >
+                      设为默认
+                    </button>
+                  )}
+
+                  <button
+                    className="secondary-button"
+                    onClick={() => onEdit(model)}
+                  >
+                    编辑
+                  </button>
+
+                  <button
+                    className="secondary-button"
+                    onClick={() => onToggle(model)}
+                  >
+                    {model.isEnabled ? '停用' : '启用'}
+                  </button>
+
+                  <button
+                    className="secondary-button"
+                    onClick={() => onDelete(model)}
+                  >
+                    删除
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="agent-list-footer">
+          显示 {filteredModels.length} 个模型，共 {models.length} 个
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ==================== 模型新增与编辑表单 ====================
+
+function ModelFormModal({
+  initialModel,
+  onClose,
+  onSubmit,
+}: {
+  initialModel?: ModelConfig;
+  onClose: () => void;
+  onSubmit: (data: ModelInput) => Promise<void>;
+}) {
+  const [name, setName] = useState(initialModel?.name ?? '');
+  const [provider, setProvider] = useState(
+    initialModel?.provider ?? 'deepseek'
+  );
+  const [modelName, setModelName] = useState(
+    initialModel?.modelName ?? 'deepseek-chat'
+  );
+  const [baseUrl, setBaseUrl] = useState(
+    initialModel?.baseUrl ?? 'https://api.deepseek.com'
+  );
+  const [description, setDescription] = useState(
+    initialModel?.description ?? ''
+  );
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  async function submitForm(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (
+      !name.trim() ||
+      !provider.trim() ||
+      !modelName.trim() ||
+      !baseUrl.trim()
+    ) {
+      setError('请填写模型名称、提供方、模型标识和 Base URL。');
+      return;
+    }
+
+    setSaving(true);
+    setError('');
+
+    try {
+      await onSubmit({
+        name: name.trim(),
+        provider: provider.trim(),
+        modelName: modelName.trim(),
+        baseUrl: baseUrl.trim(),
+        description: description.trim(),
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存模型失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="modal-overlay"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !saving) onClose();
+      }}
+    >
+      <form className="agent-modal" onSubmit={submitForm}>
+        <div className="modal-heading">
+          <div>
+            <h2>{initialModel ? '编辑模型' : '添加模型'}</h2>
+            <p>配置模型连接信息。此处不保存 API Key。</p>
+          </div>
+          <button
+            type="button"
+            className="modal-close"
+            onClick={onClose}
+            disabled={saving}
+          >
+            ×
+          </button>
+        </div>
+
+        <label className="form-field">
+          <span>显示名称 *</span>
+          <input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="例如：DeepSeek 官方模型"
+            required
+          />
+        </label>
+
+        <label className="form-field">
+          <span>提供方 *</span>
+          <select
+            value={provider}
+            onChange={(event) => setProvider(event.target.value)}
+            required
+          >
+            <option value="deepseek">DeepSeek</option>
+            <option value="openai">OpenAI 兼容接口</option>
+            <option value="qwen">通义千问</option>
+            <option value="glm">智谱 GLM</option>
+            <option value="ollama">Ollama</option>
+            <option value="custom">自定义</option>
+          </select>
+        </label>
+
+        <label className="form-field">
+          <span>模型标识 *</span>
+          <input
+            value={modelName}
+            onChange={(event) => setModelName(event.target.value)}
+            placeholder="例如：deepseek-chat"
+            required
+          />
+        </label>
+
+        <label className="form-field">
+          <span>Base URL *</span>
+          <input
+            value={baseUrl}
+            onChange={(event) => setBaseUrl(event.target.value)}
+            placeholder="https://api.example.com"
+            required
+          />
+        </label>
+
+        <label className="form-field">
+          <span>备注</span>
+          <textarea
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            placeholder="模型用途、限制或说明"
+            rows={3}
+          />
+        </label>
+
+        {error && (
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={onClose}
+            disabled={saving}
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            className="primary-button"
+            disabled={saving}
+          >
+            {saving ? '保存中...' : '保存模型'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+// ==================== 占位页面 ====================
+
 function PlaceholderPage({ page }: { page: PageId }) {
   const current = navigation.find((item) => item.id === page);
 
@@ -1160,16 +1816,68 @@ function PlaceholderPage({ page }: { page: PageId }) {
   );
 }
 
+// ==================== 应用入口 ====================
+
 export default function App() {
+  // ==================== 登录状态 ====================
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
+
   const [activePage, setActivePage] = useState<PageId>('overview');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [agentsError, setAgentsError] = useState('');
+
+  const [models, setModels] = useState<ModelConfig[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState('');
+  const [modelModalOpen, setModelModalOpen] = useState(false);
+  const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
+
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
+  async function handleLogin(username: string, password: string) {
+    setAuthError('');
 
+    const user = await loginApi(username, password);
+    setCurrentUser(user);
+
+    // 登录成功后才加载受保护的 Agent 数据
+    await reloadAgents();
+  }
+
+  async function handleRegister(input: {
+    username: string;
+    email: string;
+    password: string;
+    invitationCode: string;
+  }) {
+    setAuthError('');
+    await registerApi(input);
+    // 注册接口不会自动登录，由用户返回登录页手动登录
+  }
+
+  async function handleLogout() {
+    try {
+      await logoutApi();
+    } finally {
+      // 即使注销请求失败，也清除当前页面的登录状态
+      setCurrentUser(null);
+      setAgents([]);
+      setModels([]);
+      setSelectedAgent(null);
+      setEditingAgent(null);
+      setEditingModel(null);
+      setCreateModalOpen(false);
+      setModelModalOpen(false);
+      setActivePage('overview');
+      setMobileMenuOpen(false);
+    }
+  }
   async function reloadAgents() {
     setAgentsLoading(true);
     setAgentsError('');
@@ -1186,9 +1894,73 @@ export default function App() {
     }
   }
 
+  async function reloadModels() {
+    setModelsLoading(true);
+    setModelsError('');
+
+    try {
+      const data = await getModelsApi();
+      setModels(data);
+    } catch (error) {
+      setModelsError(
+        error instanceof Error ? error.message : '获取模型列表失败'
+      );
+    } finally {
+      setModelsLoading(false);
+    }
+  }
+
+  // 页面启动时先恢复登录会话
   useEffect(() => {
-    void reloadAgents();
+    let cancelled = false;
+
+    async function restoreSession() {
+      setAuthLoading(true);
+
+      try {
+        const user = await getCurrentUserApi();
+
+        if (cancelled) return;
+
+        if (user) {
+          setCurrentUser(user);
+          await reloadAgents();
+        } else {
+          setCurrentUser(null);
+          setAgents([]);
+          setAgentsLoading(false);
+        }
+      } catch (error) {
+        if (cancelled) return;
+
+        setCurrentUser(null);
+        setAgents([]);
+        setAgentsLoading(false);
+        setAuthError(
+          error instanceof Error
+            ? error.message
+            : '检查登录状态失败，请刷新页面重试。'
+        );
+      } finally {
+        if (!cancelled) {
+          setAuthLoading(false);
+        }
+      }
+    }
+
+    void restoreSession();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // 只有已登录用户进入模型管理页面时才加载模型
+  useEffect(() => {
+    if (currentUser && activePage === 'models') {
+      void reloadModels();
+    }
+  }, [activePage, currentUser]);
 
   async function createAgent(agentData: AgentFormData) {
     const newAgent: Agent = {
@@ -1311,6 +2083,74 @@ export default function App() {
     }
   }
 
+  async function submitModel(data: ModelInput) {
+    if (editingModel) {
+      await updateModelApi(editingModel.id, data);
+    } else {
+      await createModelApi(data);
+    }
+
+    setModelModalOpen(false);
+    setEditingModel(null);
+    await reloadModels();
+  }
+
+  async function changeDefaultModel(model: ModelConfig) {
+    if (
+      !window.confirm(
+        `确定将「${model.name}」设置为平台默认模型吗？`
+      )
+    ) {
+      return;
+    }
+
+    try {
+      await setDefaultModelApi(model.id);
+      await reloadModels();
+    } catch (error) {
+      window.alert(
+        error instanceof Error ? error.message : '设置默认模型失败'
+      );
+    }
+  }
+
+  async function toggleModel(model: ModelConfig) {
+    const nextEnabled = !model.isEnabled;
+
+    if (!nextEnabled && model.isDefault) {
+      window.alert('该模型是当前默认模型。请先启用其他模型并将其设为默认，再停用此模型。');
+      return;
+    }
+
+    try {
+      await setModelStatusApi(model.id, nextEnabled);
+      await reloadModels();
+    } catch (error) {
+      window.alert(
+        error instanceof Error ? error.message : '修改模型状态失败'
+      );
+    }
+  }
+
+  async function removeModel(model: ModelConfig) {
+    if (
+      !window.confirm(
+        `确定删除模型「${model.name}」吗？此操作无法撤销。`
+      )
+    ) {
+      return;
+    }
+
+    try {
+      await deleteModelApi(model.id);
+      await reloadModels();
+    } catch (error) {
+      window.alert(
+        error instanceof Error ? error.message : '删除模型失败'
+      );
+    }
+  }
+
   function navigate(page: PageId) {
     if (page !== 'agentDetail') {
       setActivePage(page);
@@ -1322,6 +2162,47 @@ export default function App() {
   const detailAgent = selectedAgent
     ? agents.find((item) => item.id === selectedAgent.id) ?? selectedAgent
     : null;
+
+  // 恢复会话期间不显示工作台
+  if (authLoading) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          color: '#64748b',
+        }}
+      >
+        正在检查登录状态...
+      </div>
+    );
+  }
+
+  // 未登录时只显示登录 / 注册页面
+  if (!currentUser) {
+    return (
+      <>
+        {authError && (
+          <div
+            role="alert"
+            style={{
+              padding: '10px 16px',
+              color: '#b91c1c',
+              textAlign: 'center',
+            }}
+          >
+            {authError}
+          </div>
+        )}
+
+        <AuthScreen
+          onLogin={handleLogin}
+          onRegister={handleRegister}
+        />
+      </>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -1344,13 +2225,15 @@ export default function App() {
           activePage={activePage}
           onNavigate={navigate}
           agentCount={agents.length}
+          currentUser={currentUser}
+          onLogout={() => void handleLogout()}
         />
       </div>
-
       <main className="main-area">
         <Topbar
           activePage={activePage}
           onMenuClick={() => setMobileMenuOpen(true)}
+          currentUser={currentUser}
         />
 
         <div className="page-content">
@@ -1408,10 +2291,31 @@ export default function App() {
 
           {activePage === 'playground' && <Playground agents={agents} />}
 
+          {activePage === 'models' && (
+            <ModelManagement
+              models={models}
+              loading={modelsLoading}
+              error={modelsError}
+              onRefresh={() => void reloadModels()}
+              onCreate={() => {
+                setEditingModel(null);
+                setModelModalOpen(true);
+              }}
+              onEdit={(model) => {
+                setEditingModel(model);
+                setModelModalOpen(true);
+              }}
+              onSetDefault={(model) => void changeDefaultModel(model)}
+              onToggle={(model) => void toggleModel(model)}
+              onDelete={(model) => void removeModel(model)}
+            />
+          )}
+
           {activePage !== 'overview' &&
             activePage !== 'agents' &&
             activePage !== 'agentDetail' &&
-            activePage !== 'playground' && (
+            activePage !== 'playground' &&
+            activePage !== 'models' && (
               <PlaceholderPage page={activePage} />
             )}
         </div>
@@ -1436,6 +2340,18 @@ export default function App() {
           submitLabel="保存修改"
           onClose={() => setEditingAgent(null)}
           onSubmit={updateAgent}
+        />
+      )}
+
+      {modelModalOpen && (
+        <ModelFormModal
+          key={editingModel?.id ?? 'new-model'}
+          initialModel={editingModel ?? undefined}
+          onClose={() => {
+            setModelModalOpen(false);
+            setEditingModel(null);
+          }}
+          onSubmit={submitModel}
         />
       )}
     </div>
